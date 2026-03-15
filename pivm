@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="${PIVM_STATE_DIR:-$SCRIPT_DIR/.pivm}"
+VM_NAME="${PIVM_VM_NAME:-pi-sandbox}"
+HOST_WORKSPACE="${PIVM_HOST_WORKSPACE:-$SCRIPT_DIR}"
+HOST_WORKSPACE="$(cd -- "$HOST_WORKSPACE" && pwd)"
+GUEST_WORKSPACE="/workspace"
+
+IMAGE_URL="${PIVM_IMAGE_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img}"
+BASE_IMG="$STATE_DIR/ubuntu-noble-base.img"
+VM_DISK="$STATE_DIR/${VM_NAME}.qcow2"
+SEED_ISO="$STATE_DIR/seed.iso"
+USER_DATA="$STATE_DIR/user-data"
+META_DATA="$STATE_DIR/meta-data"
+SSH_KEY="$STATE_DIR/id_ed25519"
+KNOWN_HOSTS="$STATE_DIR/known_hosts"
+PORT_FILE="$STATE_DIR/ssh_port"
+PID_FILE="$STATE_DIR/qemu.pid"
+LOG_FILE="$STATE_DIR/qemu.log"
+
+SSH_USER="${PIVM_SSH_USER:-ubuntu}"
+CPUS="${PIVM_CPUS:-4}"
+MEM_MB="${PIVM_MEM_MB:-8192}"
+DISK_SIZE="${PIVM_DISK_SIZE:-80G}"
+
+msg() {
+  echo "[pivm] $*"
+}
+
+die() {
+  echo "[pivm] ERROR: $*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required tool: $1"
+}
+
+require_tools() {
+  need qemu-system-x86_64
+  need qemu-img
+  need ssh
+  need ssh-keygen
+  need genisoimage
+  need curl
+  need rsync
+}
+
+port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnH | awk '{print $4}' | grep -E "[:.]${port}$" -q
+  else
+    (echo >"/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1
+  fi
+}
+
+choose_ssh_port() {
+  mkdir -p "$STATE_DIR"
+  if [[ -f "$PORT_FILE" ]]; then
+    cat "$PORT_FILE"
+    return
+  fi
+
+  local port="${PIVM_SSH_PORT:-22222}"
+  while port_in_use "$port"; do
+    port=$((port + 1))
+  done
+  echo "$port" >"$PORT_FILE"
+  echo "$port"
+}
+
+load_ssh_port() {
+  [[ -f "$PORT_FILE" ]] || choose_ssh_port >/dev/null
+  cat "$PORT_FILE"
+}
+
+ssh_opts() {
+  local port
+  port="$(load_ssh_port)"
+  printf '%s\n' \
+    -i "$SSH_KEY" \
+    -p "$port" \
+    -o StrictHostKeyChecking=accept-new \
+    -o UserKnownHostsFile="$KNOWN_HOSTS" \
+    -o IdentitiesOnly=yes \
+    -o LogLevel=ERROR \
+    -o ConnectTimeout=3
+}
+
+ssh_cmd() {
+  local opts=()
+  while IFS= read -r line; do
+    opts+=("$line")
+  done < <(ssh_opts)
+  ssh "${opts[@]}" "$SSH_USER@127.0.0.1" "$@"
+}
+
+ssh_tty() {
+  local opts=()
+  while IFS= read -r line; do
+    opts+=("$line")
+  done < <(ssh_opts)
+  ssh -tt "${opts[@]}" "$SSH_USER@127.0.0.1" "$@"
+}
+
+rsync_ssh_cmd() {
+  local port
+  port="$(load_ssh_port)"
+  printf 'ssh -i %q -p %q -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%q -o IdentitiesOnly=yes -o LogLevel=ERROR' \
+    "$SSH_KEY" "$port" "$KNOWN_HOSTS"
+}
+
+is_running() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid
+  pid="$(cat "$PID_FILE")"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+cleanup_stale_pid() {
+  if [[ -f "$PID_FILE" ]] && ! is_running; then
+    rm -f "$PID_FILE"
+  fi
+}
+
+download_base_image() {
+  if [[ -f "$BASE_IMG" ]]; then
+    return
+  fi
+  msg "Downloading Ubuntu cloud image..."
+  curl -fL "$IMAGE_URL" -o "$BASE_IMG.tmp"
+  mv "$BASE_IMG.tmp" "$BASE_IMG"
+}
+
+generate_ssh_key() {
+  if [[ -f "$SSH_KEY" ]]; then
+    return
+  fi
+  msg "Generating SSH key for VM access..."
+  ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" >/dev/null
+}
+
+write_cloud_init() {
+  local pubkey
+  pubkey="$(cat "$SSH_KEY.pub")"
+
+  cat >"$USER_DATA" <<EOF
+#cloud-config
+hostname: ${VM_NAME}
+manage_etc_hosts: true
+users:
+  - name: ${SSH_USER}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${pubkey}
+package_update: true
+package_upgrade: false
+packages:
+  - git
+  - gh
+  - curl
+  - ca-certificates
+  - gnupg
+  - jq
+  - rsync
+  - python3
+  - python3-pip
+  - ripgrep
+  - fd-find
+  - build-essential
+runcmd:
+  - mkdir -p ${GUEST_WORKSPACE}
+  - grep -q '^workspace ${GUEST_WORKSPACE} 9p' /etc/fstab || echo 'workspace ${GUEST_WORKSPACE} 9p trans=virtio,version=9p2000.L,msize=104857600,rw,_netdev 0 0' >> /etc/fstab
+  - mount -a || true
+  - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+  - apt-get install -y nodejs
+  - npm install -g @mariozechner/pi-coding-agent@latest
+EOF
+
+  cat >"$META_DATA" <<EOF
+instance-id: ${VM_NAME}
+local-hostname: ${VM_NAME}
+EOF
+
+  genisoimage -quiet -output "$SEED_ISO" -volid cidata -joliet -rock "$USER_DATA" "$META_DATA"
+}
+
+create_vm_disk() {
+  if [[ -f "$VM_DISK" ]]; then
+    return
+  fi
+  msg "Creating VM disk ($DISK_SIZE)..."
+  qemu-img create -f qcow2 -F qcow2 -b "$BASE_IMG" "$VM_DISK" "$DISK_SIZE" >/dev/null
+}
+
+init_vm() {
+  require_tools
+  mkdir -p "$STATE_DIR"
+  download_base_image
+  generate_ssh_key
+  write_cloud_init
+  create_vm_disk
+  choose_ssh_port >/dev/null
+  msg "Init complete."
+}
+
+start_vm() {
+  cleanup_stale_pid
+  if is_running; then
+    msg "VM already running."
+    return
+  fi
+
+  local accel cpu ssh_port
+  ssh_port="$(load_ssh_port)"
+
+  if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+    accel="kvm"
+    cpu="host"
+  else
+    accel="tcg"
+    cpu="max"
+  fi
+
+  msg "Starting VM (ssh on 127.0.0.1:${ssh_port})..."
+
+  qemu-system-x86_64 \
+    -name "$VM_NAME" \
+    -machine "q35,accel=${accel}" \
+    -cpu "$cpu" \
+    -smp "$CPUS" \
+    -m "$MEM_MB" \
+    -display none \
+    -daemonize \
+    -pidfile "$PID_FILE" \
+    -serial "file:${LOG_FILE}" \
+    -device virtio-rng-pci \
+    -nic "user,model=virtio,hostfwd=tcp:127.0.0.1:${ssh_port}-:22" \
+    -drive "if=virtio,file=${VM_DISK},format=qcow2" \
+    -drive "if=virtio,media=cdrom,file=${SEED_ISO},format=raw,readonly=on" \
+    -virtfs "local,path=${HOST_WORKSPACE},mount_tag=workspace,security_model=none,multidevs=remap,id=workspace"
+
+  sleep 1
+  is_running || die "VM failed to start. Check $LOG_FILE"
+}
+
+wait_for_ssh() {
+  msg "Waiting for SSH..."
+  for _ in $(seq 1 150); do
+    if ssh_cmd "true" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 2
+  done
+  die "SSH did not become ready in time. Check $LOG_FILE"
+}
+
+wait_for_cloud_init() {
+  msg "Waiting for cloud-init bootstrap (first start can take a few minutes)..."
+  ssh_cmd "bash -lc 'sudo cloud-init status --wait >/dev/null 2>&1 || true'" || true
+}
+
+sync_pi_agent() {
+  local src="$HOME/.pi/agent"
+  [[ -d "$src" ]] || return 0
+
+  msg "Syncing host ~/.pi/agent into VM (excluding sessions/cache)..."
+  ssh_cmd "mkdir -p /home/${SSH_USER}/.pi/agent"
+
+  rsync -az --delete \
+    --exclude 'sessions/' \
+    --exclude 'cache/' \
+    --exclude 'pi-debug.log' \
+    -e "$(rsync_ssh_cmd)" \
+    "$src/" "${SSH_USER}@127.0.0.1:/home/${SSH_USER}/.pi/agent/"
+
+  ssh_cmd "bash -lc 'chmod 700 /home/${SSH_USER}/.pi /home/${SSH_USER}/.pi/agent 2>/dev/null || true; chmod 600 /home/${SSH_USER}/.pi/agent/auth.json 2>/dev/null || true'"
+}
+
+ensure_guest_workspace_mount() {
+  ssh_cmd "bash -lc 'sudo mkdir -p ${GUEST_WORKSPACE}; sudo mount -a >/dev/null 2>&1 || true'"
+}
+
+guest_cwd_from_host_pwd() {
+  local pwd_now rel
+  pwd_now="$(pwd)"
+  if [[ "$pwd_now" == "$HOST_WORKSPACE"* ]]; then
+    rel="${pwd_now#$HOST_WORKSPACE}"
+    if [[ -z "$rel" ]]; then
+      echo "$GUEST_WORKSPACE"
+    else
+      echo "${GUEST_WORKSPACE}${rel}"
+    fi
+  else
+    echo "$GUEST_WORKSPACE"
+  fi
+}
+
+get_gh_token() {
+  if [[ -n "${GH_TOKEN:-}" ]]; then
+    echo "$GH_TOKEN"
+    return
+  fi
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    echo "$GITHUB_TOKEN"
+    return
+  fi
+  if command -v gh >/dev/null 2>&1; then
+    gh auth token 2>/dev/null || true
+  fi
+}
+
+run_pi() {
+  init_vm
+  start_vm
+  wait_for_ssh
+  wait_for_cloud_init
+  ensure_guest_workspace_mount
+  sync_pi_agent
+
+  local gh_token guest_dir env_prefix remote_cmd
+  gh_token="$(get_gh_token)"
+  guest_dir="$(guest_cwd_from_host_pwd)"
+
+  remote_cmd="cd $(printf '%q' "$guest_dir"); "
+  remote_cmd+="if command -v gh >/dev/null 2>&1; then gh auth setup-git >/dev/null 2>&1 || true; fi; "
+  remote_cmd+="if command -v npm >/dev/null 2>&1; then npm install -g @mariozechner/pi-coding-agent@latest >/dev/null 2>&1 || true; fi; "
+  remote_cmd+="exec pi"
+
+  for arg in "$@"; do
+    remote_cmd+=" $(printf '%q' "$arg")"
+  done
+
+  env_prefix=""
+  if [[ -n "$gh_token" ]]; then
+    env_prefix="export GH_TOKEN=$(printf '%q' "$gh_token"); export GITHUB_TOKEN=$(printf '%q' "$gh_token"); "
+  else
+    msg "Warning: could not resolve GH token from host (gh auth token / env)."
+  fi
+
+  ssh_tty "bash -lc $(printf '%q' "${env_prefix}${remote_cmd}")"
+}
+
+open_shell() {
+  init_vm
+  start_vm
+  wait_for_ssh
+  wait_for_cloud_init
+  ensure_guest_workspace_mount
+  sync_pi_agent
+  ssh_tty "bash -lc 'cd ${GUEST_WORKSPACE}; exec bash -l'"
+}
+
+stop_vm() {
+  cleanup_stale_pid
+  if ! is_running; then
+    msg "VM is already stopped."
+    return
+  fi
+
+  local pid
+  pid="$(cat "$PID_FILE")"
+  msg "Stopping VM (pid $pid)..."
+  kill "$pid" 2>/dev/null || true
+
+  for _ in $(seq 1 30); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$PID_FILE"
+      msg "VM stopped."
+      return
+    fi
+    sleep 1
+  done
+
+  msg "Force killing VM..."
+  kill -9 "$pid" 2>/dev/null || true
+  rm -f "$PID_FILE"
+}
+
+status_vm() {
+  local port
+  port="$(load_ssh_port)"
+
+  if is_running; then
+    local pid
+    pid="$(cat "$PID_FILE")"
+    echo "running"
+    echo "  pid: $pid"
+    echo "  ssh: ${SSH_USER}@127.0.0.1:${port}"
+    echo "  workspace: $HOST_WORKSPACE -> ${GUEST_WORKSPACE}"
+  else
+    echo "stopped"
+    echo "  configured ssh port: $port"
+    echo "  workspace: $HOST_WORKSPACE -> ${GUEST_WORKSPACE}"
+  fi
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  ./pivm                 # Start/resume VM and run pi inside it
+  ./pivm [pi args...]    # Pass args to pi (inside VM)
+
+  ./pivm init            # One-time image/disk/cloud-init setup
+  ./pivm start           # Start VM only
+  ./pivm ssh             # Open interactive shell in VM
+  ./pivm status          # Show VM status
+  ./pivm stop            # Stop VM
+
+Environment overrides:
+  PIVM_STATE_DIR, PIVM_HOST_WORKSPACE, PIVM_SSH_PORT,
+  PIVM_CPUS, PIVM_MEM_MB, PIVM_DISK_SIZE, PIVM_IMAGE_URL
+EOF
+}
+
+main() {
+  local subcmd="run"
+
+  if [[ $# -gt 0 ]]; then
+    case "$1" in
+      init|start|stop|status|ssh|help|-h|--help)
+        subcmd="$1"
+        shift
+        ;;
+    esac
+  fi
+
+  case "$subcmd" in
+    init)
+      init_vm
+      ;;
+    start)
+      init_vm
+      start_vm
+      wait_for_ssh
+      wait_for_cloud_init
+      ensure_guest_workspace_mount
+      sync_pi_agent
+      msg "VM ready."
+      ;;
+    stop)
+      stop_vm
+      ;;
+    status)
+      status_vm
+      ;;
+    ssh)
+      open_shell
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    run)
+      run_pi "$@"
+      ;;
+    *)
+      die "Unknown command: $subcmd"
+      ;;
+  esac
+}
+
+main "$@"
