@@ -91,17 +91,22 @@ Set extra extension files/dirs (colon-separated):
 export PIVM_PI_EXTENSION_SOURCES="$PWD/extensions:/path/to/more/extensions"
 ```
 
-## Recommended extensions
+## Recommended extensions (autonomy-first)
 
-If you want more than `/paste`, I recommend starting with:
+If your goal is minimal human intervention, start with automation-heavy extensions instead of confirmation guards:
 
-- `permission-gate.ts` (confirm dangerous commands)
-- `protected-paths.ts` (guard `.env`, `.git`, `node_modules`)
-- `plan-mode/` (read-only planning mode)
-- `notify.ts` (desktop notification when agent finishes)
-- `tools.ts` (interactive tool toggling)
+- `trigger-compact.ts` (auto-compacts when context gets large)
+- `subagent/` (delegates scoped work to subagents)
+- `git-checkpoint.ts` (automatic branch-safe checkpoints)
+- `auto-commit-on-exit.ts` (auto-commit on session end)
+- `notify.ts` (only for completion signal; no interactive step)
 
-You can copy these from pi examples:
+Optional third-party packages:
+
+- `npm:shitty-extensions` (includes `loop.ts` for autonomous looping)
+- `npm:@netandreus/pi-auto` (usage-aware model selection / load balancing)
+
+You can copy built-in examples from:
 
 ```text
 /usr/local/lib/node_modules/@mariozechner/pi-coding-agent/examples/extensions
