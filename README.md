@@ -1,15 +1,18 @@
 # pivm PoC
 
-`pivm` runs `pi` inside a local QEMU VM while keeping usage close to host UX.
+`pivm` runs `pi` inside local QEMU VMs while keeping usage close to host UX.
 
 ## What it does
 
-- Starts/resumes a sandbox VM
+- Supports multiple named VM sessions
+- Prompts to **resume** an existing session or **start a new one**
+- Stores per-session VM state in `.pivm/sessions/<session-name>`
+- Shares one downloaded Ubuntu base image across sessions (`.pivm/ubuntu-noble-base.img`)
 - Mounts this folder into VM at `/workspace`
 - Syncs host `~/.pi/agent` (excluding sessions/cache) into VM
 - Syncs local pi extensions from `./extensions` into VM (`~/.pi/agent/extensions`)
 - Ships a built-in `/paste` extension (`extensions/paste.ts`)
-- Syncs your local gstack pi-port into VM (`~/.pi/agent/skills/gstack`) and creates top-level skill symlinks
+- Syncs gstack pi-port into VM (`~/.pi/agent/skills/gstack`) from a repo cache (auto clone/pull) and creates top-level skill symlinks
 - Optionally snapshots host clipboard into VM for `/paste` fallback
 - Exposes host GitHub auth to VM via `GH_TOKEN="$(gh auth token)"`
 - Ensures latest `pi` version in VM (`npm i -g @mariozechner/pi-coding-agent@latest`)
@@ -23,32 +26,80 @@ From this folder:
 ./pivm
 ```
 
-Pass args to pi:
+If sessions already exist, `pivm` asks whether to resume or start a new one.
+
+Create/resume explicitly:
+
+```bash
+./pivm new
+./pivm new my-feature
+
+./pivm resume
+./pivm resume my-feature
+
+./pivm sessions
+```
+
+Pass args to `pi`:
 
 ```bash
 ./pivm --model sonnet
 ./pivm -p "summarize this repo"
+./pivm --resume my-feature --model sonnet
 ```
 
-VM management:
+Session selection flags on default run mode:
 
 ```bash
-./pivm init
-./pivm start
-./pivm ssh
-./pivm status
-./pivm stop
+./pivm --new --model sonnet
+./pivm --resume                # resume last/running session
+./pivm --resume my-feature
+./pivm --session my-feature    # use this session (create if missing)
 ```
+
+VM/session management:
+
+```bash
+./pivm init my-feature
+./pivm start my-feature
+./pivm ssh my-feature
+./pivm status
+./pivm status my-feature
+./pivm stop my-feature
+./pivm stop --all
+```
+
+## Session model
+
+- A session is one VM state directory under `.pivm/sessions/<name>`.
+- Multiple sessions can run at the same time.
+- SSH ports are auto-assigned per session (starting from `22222`, incrementing if occupied).
+- The last used session is remembered in `.pivm/last-session`.
 
 ## gstack port integration
 
-By default, pivm tries to sync this host path into VM skills:
+By default, pivm clones/pulls this repo on the host and syncs `port/gstack` into VM skills:
 
 ```text
-~/gstack-pi-port/port/gstack
+https://github.com/westn/gstack-pi-port.git
 ```
 
-Override if needed:
+The clone is cached at:
+
+```text
+.pivm/sources/gstack-pi-port
+```
+
+Override repo source/branch/cache path:
+
+```bash
+export PIVM_GSTACK_REPO_URL=https://github.com/westn/gstack-pi-port.git
+export PIVM_GSTACK_REPO_BRANCH=main
+export PIVM_GSTACK_REPO_DIR="$PWD/.pivm/sources/gstack-pi-port"
+export PIVM_GSTACK_PORT_SUBDIR=port/gstack
+```
+
+If you already have a prebuilt local port directory, use it directly:
 
 ```bash
 export PIVM_GSTACK_PORT_DIR=/path/to/gstack-pi-port/port/gstack
@@ -115,5 +166,5 @@ You can copy built-in examples from:
 ## Notes
 
 - First run can take several minutes (cloud image + package bootstrap).
-- Default SSH port is `22222` (auto-increments if taken).
 - If you want this tied to another repo/folder, copy `pivm` into that folder (or set `PIVM_HOST_WORKSPACE`).
+- For full options, run `./pivm help`.

@@ -2,23 +2,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-STATE_DIR="${PIVM_STATE_DIR:-$SCRIPT_DIR/.pivm}"
-VM_NAME="${PIVM_VM_NAME:-pi-sandbox}"
+
+STATE_HOME="${PIVM_STATE_HOME:-$SCRIPT_DIR/.pivm}"
+STATE_ROOT="${PIVM_STATE_ROOT:-$STATE_HOME/sessions}"
+FORCED_STATE_DIR="${PIVM_STATE_DIR:-}"
+LAST_SESSION_FILE="${PIVM_LAST_SESSION_FILE:-$STATE_HOME/last-session}"
+SESSION_NAME="${PIVM_SESSION:-}"
+
 HOST_WORKSPACE="${PIVM_HOST_WORKSPACE:-$SCRIPT_DIR}"
 HOST_WORKSPACE="$(cd -- "$HOST_WORKSPACE" && pwd)"
 GUEST_WORKSPACE="/workspace"
 
 IMAGE_URL="${PIVM_IMAGE_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img}"
-BASE_IMG="$STATE_DIR/ubuntu-noble-base.img"
-VM_DISK="$STATE_DIR/${VM_NAME}.qcow2"
-SEED_ISO="$STATE_DIR/seed.iso"
-USER_DATA="$STATE_DIR/user-data"
-META_DATA="$STATE_DIR/meta-data"
-SSH_KEY="$STATE_DIR/id_ed25519"
-KNOWN_HOSTS="$STATE_DIR/known_hosts"
-PORT_FILE="$STATE_DIR/ssh_port"
-PID_FILE="$STATE_DIR/qemu.pid"
-LOG_FILE="$STATE_DIR/qemu.log"
+BASE_IMAGE_OVERRIDE="${PIVM_BASE_IMAGE_FILE:-}"
 
 SSH_USER="${PIVM_SSH_USER:-ubuntu}"
 CPUS="${PIVM_CPUS:-4}"
@@ -31,15 +27,37 @@ PI_SKILLS_DIR="${PI_AGENT_DIR}/skills"
 
 PIVM_PI_EXTENSION_SOURCES="${PIVM_PI_EXTENSION_SOURCES:-$SCRIPT_DIR/extensions}"
 PIVM_SYNC_GSTACK="${PIVM_SYNC_GSTACK:-1}"
-PIVM_GSTACK_PORT_DIR="${PIVM_GSTACK_PORT_DIR:-$HOME/gstack-pi-port/port/gstack}"
+PIVM_GSTACK_PORT_DIR="${PIVM_GSTACK_PORT_DIR:-}"
+PIVM_GSTACK_REPO_URL="${PIVM_GSTACK_REPO_URL:-https://github.com/westn/gstack-pi-port.git}"
+PIVM_GSTACK_REPO_BRANCH="${PIVM_GSTACK_REPO_BRANCH:-main}"
+PIVM_GSTACK_REPO_DIR="${PIVM_GSTACK_REPO_DIR:-$STATE_HOME/sources/gstack-pi-port}"
+PIVM_GSTACK_PORT_SUBDIR="${PIVM_GSTACK_PORT_SUBDIR:-port/gstack}"
 PIVM_GSTACK_BUILD="${PIVM_GSTACK_BUILD:-0}"
 
 PIVM_SYNC_HOST_CLIPBOARD="${PIVM_SYNC_HOST_CLIPBOARD:-1}"
-PIVM_CLIPBOARD_SNAPSHOT_FILE="${PIVM_CLIPBOARD_SNAPSHOT_FILE:-$STATE_DIR/host-clipboard.txt}"
+PIVM_CLIPBOARD_SNAPSHOT_FILE_OVERRIDE="${PIVM_CLIPBOARD_SNAPSHOT_FILE:-}"
 PIVM_GUEST_CLIPBOARD_FILE="${PIVM_GUEST_CLIPBOARD_FILE:-/home/${SSH_USER}/.pivm/host-clipboard.txt}"
 
+STATE_DIR=""
+VM_NAME=""
+BASE_IMG=""
+VM_DISK=""
+SEED_ISO=""
+USER_DATA=""
+META_DATA=""
+SSH_KEY=""
+KNOWN_HOSTS=""
+PORT_FILE=""
+PID_FILE=""
+LOG_FILE=""
+CLIPBOARD_SNAPSHOT_FILE=""
+
 msg() {
-  echo "[pivm] $*"
+  if [[ -n "${SESSION_NAME:-}" ]]; then
+    echo "[pivm:${SESSION_NAME}] $*"
+  else
+    echo "[pivm] $*"
+  fi
 }
 
 die() {
@@ -59,6 +77,464 @@ require_tools() {
   need genisoimage
   need curl
   need rsync
+}
+
+is_valid_session_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+ensure_valid_session_name() {
+  local name="$1"
+  is_valid_session_name "$name" || die "Invalid session name '$name' (allowed: letters, numbers, ., _, -)"
+}
+
+legacy_layout_exists() {
+  [[ -n "$FORCED_STATE_DIR" ]] && return 1
+  [[ -d "$STATE_HOME" ]] || return 1
+
+  local candidate
+  for candidate in "$STATE_HOME"/*.qcow2; do
+    if [[ -e "$candidate" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+session_state_dir() {
+  local session="$1"
+
+  if [[ "$session" == "default" ]] && legacy_layout_exists && [[ ! -d "$STATE_ROOT/default" ]]; then
+    printf '%s\n' "$STATE_HOME"
+    return
+  fi
+
+  printf '%s/%s\n' "$STATE_ROOT" "$session"
+}
+
+all_session_names() {
+  local names=()
+
+  if [[ -d "$STATE_ROOT" ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      names+=("$name")
+    done < <(find "$STATE_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
+  fi
+
+  if legacy_layout_exists && [[ ! -d "$STATE_ROOT/default" ]]; then
+    names+=("default")
+  fi
+
+  ((${#names[@]} > 0)) || return 0
+
+  printf '%s\n' "${names[@]}" | sort -u
+}
+
+is_state_running_dir() {
+  local state_dir="$1"
+  local pid_file="${state_dir}/qemu.pid"
+
+  [[ -f "$pid_file" ]] || return 1
+
+  local pid
+  pid="$(cat "$pid_file" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 1
+
+  kill -0 "$pid" 2>/dev/null
+}
+
+session_exists() {
+  local session="$1"
+  [[ -d "$(session_state_dir "$session")" ]]
+}
+
+session_is_running() {
+  local session="$1"
+  is_state_running_dir "$(session_state_dir "$session")"
+}
+
+load_last_session() {
+  [[ -f "$LAST_SESSION_FILE" ]] || return 0
+  cat "$LAST_SESSION_FILE"
+}
+
+remember_session() {
+  local session="$1"
+  [[ -n "$session" ]] || return 0
+
+  if [[ -n "$FORCED_STATE_DIR" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$LAST_SESSION_FILE")"
+  echo "$session" >"$LAST_SESSION_FILE"
+}
+
+generate_session_name() {
+  mkdir -p "$STATE_ROOT"
+
+  local base name i
+  base="session-$(date +%Y%m%d-%H%M%S)"
+  name="$base"
+  i=1
+
+  while session_exists "$name"; do
+    name="${base}-${i}"
+    i=$((i + 1))
+  done
+
+  echo "$name"
+}
+
+default_resume_session() {
+  local preferred
+  preferred="$(load_last_session)"
+  if [[ -n "$preferred" ]] && session_exists "$preferred"; then
+    echo "$preferred"
+    return
+  fi
+
+  local session
+  while IFS= read -r session; do
+    if session_is_running "$session"; then
+      echo "$session"
+      return
+    fi
+  done < <(all_session_names)
+
+  while IFS= read -r session; do
+    echo "$session"
+    return
+  done < <(all_session_names)
+}
+
+configure_state_for_session() {
+  local requested_session="$1"
+
+  if [[ -z "$requested_session" ]]; then
+    requested_session="default"
+  fi
+
+  SESSION_NAME="$requested_session"
+
+  if [[ -n "$FORCED_STATE_DIR" ]]; then
+    STATE_DIR="$FORCED_STATE_DIR"
+  else
+    STATE_DIR="$(session_state_dir "$SESSION_NAME")"
+  fi
+
+  VM_NAME="${PIVM_VM_NAME:-pi-sandbox}"
+
+  if [[ -n "$BASE_IMAGE_OVERRIDE" ]]; then
+    BASE_IMG="$BASE_IMAGE_OVERRIDE"
+  elif [[ -n "$FORCED_STATE_DIR" ]]; then
+    BASE_IMG="$STATE_DIR/ubuntu-noble-base.img"
+  else
+    BASE_IMG="$STATE_HOME/ubuntu-noble-base.img"
+  fi
+
+  VM_DISK="$STATE_DIR/${VM_NAME}.qcow2"
+  SEED_ISO="$STATE_DIR/seed.iso"
+  USER_DATA="$STATE_DIR/user-data"
+  META_DATA="$STATE_DIR/meta-data"
+  SSH_KEY="$STATE_DIR/id_ed25519"
+  KNOWN_HOSTS="$STATE_DIR/known_hosts"
+  PORT_FILE="$STATE_DIR/ssh_port"
+  PID_FILE="$STATE_DIR/qemu.pid"
+  LOG_FILE="$STATE_DIR/qemu.log"
+
+  if [[ -n "$PIVM_CLIPBOARD_SNAPSHOT_FILE_OVERRIDE" ]]; then
+    CLIPBOARD_SNAPSHOT_FILE="$PIVM_CLIPBOARD_SNAPSHOT_FILE_OVERRIDE"
+  else
+    CLIPBOARD_SNAPSHOT_FILE="$STATE_DIR/host-clipboard.txt"
+  fi
+}
+
+prompt_resume_or_new() {
+  local default_session="$1"
+
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    echo "resume"
+    return
+  fi
+
+  local answer
+  read -r -p "Resume existing session (${default_session}) or start a new one? [R/n]: " answer
+  case "${answer,,}" in
+    n|new)
+      echo "new"
+      ;;
+    *)
+      echo "resume"
+      ;;
+  esac
+}
+
+choose_existing_session_interactive() {
+  local default_session="$1"
+
+  local sessions=()
+  mapfile -t sessions < <(all_session_names)
+
+  ((${#sessions[@]} > 0)) || return 1
+
+  local last_session
+  last_session="$(load_last_session)"
+
+  echo "Available pivm sessions:"
+  local idx=1
+  local session
+  for session in "${sessions[@]}"; do
+    local status marker
+    status="stopped"
+    marker=""
+
+    if session_is_running "$session"; then
+      status="running"
+    fi
+    if [[ -n "$last_session" && "$session" == "$last_session" ]]; then
+      marker=" (last)"
+    fi
+
+    echo "  [$idx] $session [$status]$marker"
+    idx=$((idx + 1))
+  done
+
+  while true; do
+    local answer
+    read -r -p "Select session number/name to resume (blank for ${default_session}): " answer
+
+    if [[ -z "$answer" ]]; then
+      echo "$default_session"
+      return
+    fi
+
+    if [[ "$answer" =~ ^[0-9]+$ ]]; then
+      if ((answer >= 1 && answer <= ${#sessions[@]})); then
+        echo "${sessions[$((answer - 1))]}"
+        return
+      fi
+    else
+      if session_exists "$answer"; then
+        echo "$answer"
+        return
+      fi
+    fi
+
+    msg "Invalid selection. Try again."
+  done
+}
+
+resolve_run_session() {
+  local mode="$1"
+  local requested="$2"
+
+  if [[ -n "$FORCED_STATE_DIR" ]]; then
+    local forced_session
+    forced_session="${requested:-${SESSION_NAME:-default}}"
+    ensure_valid_session_name "$forced_session"
+    configure_state_for_session "$forced_session"
+    remember_session "$forced_session"
+    return
+  fi
+
+  mkdir -p "$STATE_HOME" "$STATE_ROOT"
+
+  local chosen=""
+
+  case "$mode" in
+    new)
+      if [[ -n "$requested" ]]; then
+        ensure_valid_session_name "$requested"
+        chosen="$requested"
+      else
+        chosen="$(generate_session_name)"
+      fi
+
+      if session_exists "$chosen"; then
+        die "Session '$chosen' already exists. Use './pivm resume $chosen' or choose a different name."
+      fi
+      ;;
+
+    resume)
+      if [[ -n "$requested" ]]; then
+        ensure_valid_session_name "$requested"
+        chosen="$requested"
+      elif [[ -n "${SESSION_NAME:-}" ]]; then
+        ensure_valid_session_name "$SESSION_NAME"
+        chosen="$SESSION_NAME"
+      else
+        if [[ -t 0 && -t 1 ]]; then
+          chosen="$(choose_existing_session_interactive "$(default_resume_session)")" || true
+        else
+          chosen="$(default_resume_session)"
+        fi
+      fi
+
+      [[ -n "$chosen" ]] || die "No existing sessions to resume. Use './pivm new'."
+      session_exists "$chosen" || die "Session '$chosen' does not exist. Use './pivm sessions' or './pivm new'."
+      ;;
+
+    auto)
+      if [[ -n "$requested" ]]; then
+        ensure_valid_session_name "$requested"
+        chosen="$requested"
+      elif [[ -n "${SESSION_NAME:-}" ]]; then
+        ensure_valid_session_name "$SESSION_NAME"
+        chosen="$SESSION_NAME"
+      else
+        local sessions=()
+        mapfile -t sessions < <(all_session_names)
+
+        if ((${#sessions[@]} == 0)); then
+          chosen="$(generate_session_name)"
+        elif [[ -t 0 && -t 1 ]]; then
+          local default_session action
+          default_session="$(default_resume_session)"
+          action="$(prompt_resume_or_new "$default_session")"
+
+          if [[ "$action" == "new" ]]; then
+            chosen="$(generate_session_name)"
+          else
+            if ((${#sessions[@]} == 1)); then
+              chosen="$default_session"
+            else
+              chosen="$(choose_existing_session_interactive "$default_session")"
+            fi
+          fi
+        else
+          chosen="$(default_resume_session)"
+          [[ -n "$chosen" ]] || chosen="$(generate_session_name)"
+        fi
+      fi
+      ;;
+
+    *)
+      die "Unknown run session mode: $mode"
+      ;;
+  esac
+
+  [[ -n "$chosen" ]] || die "Could not determine pivm session."
+  ensure_valid_session_name "$chosen"
+
+  configure_state_for_session "$chosen"
+  remember_session "$chosen"
+}
+
+resolve_command_session() {
+  local command="$1"
+  local requested="$2"
+
+  if [[ -n "$FORCED_STATE_DIR" ]]; then
+    local forced_session
+    forced_session="${requested:-${SESSION_NAME:-default}}"
+    ensure_valid_session_name "$forced_session"
+    configure_state_for_session "$forced_session"
+    remember_session "$forced_session"
+    return
+  fi
+
+  mkdir -p "$STATE_HOME" "$STATE_ROOT"
+
+  local chosen=""
+
+  if [[ -n "$requested" ]]; then
+    ensure_valid_session_name "$requested"
+    chosen="$requested"
+  elif [[ -n "${SESSION_NAME:-}" ]]; then
+    ensure_valid_session_name "$SESSION_NAME"
+    chosen="$SESSION_NAME"
+  else
+    chosen="$(default_resume_session)"
+    if [[ -z "$chosen" ]]; then
+      case "$command" in
+        init|start)
+          chosen="default"
+          ;;
+        *)
+          die "No pivm sessions found. Use './pivm new' to create one."
+          ;;
+      esac
+    fi
+  fi
+
+  ensure_valid_session_name "$chosen"
+
+  if [[ "$command" != "init" && "$command" != "start" ]]; then
+    session_exists "$chosen" || die "Session '$chosen' does not exist. Use './pivm sessions'."
+  fi
+
+  configure_state_for_session "$chosen"
+  remember_session "$chosen"
+}
+
+list_sessions_overview() {
+  if [[ -n "$FORCED_STATE_DIR" ]]; then
+    local forced_session
+    forced_session="${SESSION_NAME:-default}"
+    configure_state_for_session "$forced_session"
+    status_vm
+    return
+  fi
+
+  mkdir -p "$STATE_HOME" "$STATE_ROOT"
+
+  local sessions=()
+  mapfile -t sessions < <(all_session_names)
+
+  if ((${#sessions[@]} == 0)); then
+    echo "No pivm sessions yet. Start one with './pivm new' or just './pivm'."
+    return
+  fi
+
+  local last_session
+  last_session="$(load_last_session)"
+
+  echo "pivm sessions:"
+  local session
+  for session in "${sessions[@]}"; do
+    local state_dir status port marker
+    state_dir="$(session_state_dir "$session")"
+    status="stopped"
+    port="-"
+    marker=""
+
+    if is_state_running_dir "$state_dir"; then
+      status="running"
+    fi
+    if [[ -f "$state_dir/ssh_port" ]]; then
+      port="$(cat "$state_dir/ssh_port")"
+    fi
+    if [[ -n "$last_session" && "$session" == "$last_session" ]]; then
+      marker=" (last)"
+    fi
+
+    printf '  %-26s %-8s ssh:%s%s\n' "$session" "$status" "$port" "$marker"
+  done
+}
+
+stop_all_sessions() {
+  if [[ -n "$FORCED_STATE_DIR" ]]; then
+    resolve_command_session "stop" "${SESSION_NAME:-default}"
+    stop_vm
+    return
+  fi
+
+  local sessions=()
+  mapfile -t sessions < <(all_session_names)
+
+  if ((${#sessions[@]} == 0)); then
+    msg "No sessions to stop."
+    return
+  fi
+
+  local session
+  for session in "${sessions[@]}"; do
+    configure_state_for_session "$session"
+    stop_vm
+  done
 }
 
 port_in_use() {
@@ -144,6 +620,9 @@ download_base_image() {
   if [[ -f "$BASE_IMG" ]]; then
     return
   fi
+
+  mkdir -p "$(dirname "$BASE_IMG")"
+
   msg "Downloading Ubuntu cloud image..."
   curl -fL "$IMAGE_URL" -o "$BASE_IMG.tmp"
   mv "$BASE_IMG.tmp" "$BASE_IMG"
@@ -298,7 +777,7 @@ sync_pi_agent() {
 snapshot_host_clipboard() {
   [[ "$PIVM_SYNC_HOST_CLIPBOARD" = "1" ]] || return 0
 
-  mkdir -p "$(dirname "$PIVM_CLIPBOARD_SNAPSHOT_FILE")"
+  mkdir -p "$(dirname "$CLIPBOARD_SNAPSHOT_FILE")"
 
   local text=""
   if [[ -n "${PIVM_CLIPBOARD_SOURCE_CMD:-}" ]]; then
@@ -321,19 +800,19 @@ snapshot_host_clipboard() {
     text="${text:0:1048576}"
   fi
 
-  printf '%s' "$text" >"$PIVM_CLIPBOARD_SNAPSHOT_FILE"
+  printf '%s' "$text" >"$CLIPBOARD_SNAPSHOT_FILE"
 }
 
 sync_clipboard_snapshot() {
   [[ "$PIVM_SYNC_HOST_CLIPBOARD" = "1" ]] || return 0
-  [[ -f "$PIVM_CLIPBOARD_SNAPSHOT_FILE" ]] || return 0
+  [[ -f "$CLIPBOARD_SNAPSHOT_FILE" ]] || return 0
 
   msg "Syncing clipboard snapshot for /paste extension..."
   ssh_cmd "mkdir -p /home/${SSH_USER}/.pivm"
 
   rsync -az \
     -e "$(rsync_ssh_cmd)" \
-    "$PIVM_CLIPBOARD_SNAPSHOT_FILE" "${SSH_USER}@127.0.0.1:${PIVM_GUEST_CLIPBOARD_FILE}"
+    "$CLIPBOARD_SNAPSHOT_FILE" "${SSH_USER}@127.0.0.1:${PIVM_GUEST_CLIPBOARD_FILE}"
 }
 
 sync_pi_extensions() {
@@ -343,6 +822,7 @@ sync_pi_extensions() {
   ssh_cmd "mkdir -p ${PI_EXTENSIONS_DIR}"
 
   local IFS=":"
+  local src
   for src in $sources; do
     [[ -n "$src" ]] || continue
 
@@ -363,12 +843,78 @@ sync_pi_extensions() {
   done
 }
 
+resolve_gstack_port_source() {
+  local override_dir="${PIVM_GSTACK_PORT_DIR:-}"
+  if [[ -n "$override_dir" ]]; then
+    if [[ -f "$override_dir/SKILL.md" ]]; then
+      printf '%s\n' "$override_dir"
+      return 0
+    fi
+    msg "Configured PIVM_GSTACK_PORT_DIR missing SKILL.md: $override_dir (falling back to repo sync)" >&2
+  fi
+
+  if [[ -z "${PIVM_GSTACK_REPO_URL:-}" ]]; then
+    msg "PIVM_GSTACK_REPO_URL is empty and no valid PIVM_GSTACK_PORT_DIR provided. Skipping gstack sync." >&2
+    return 1
+  fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    msg "git not found on host and no valid PIVM_GSTACK_PORT_DIR provided. Skipping gstack sync." >&2
+    return 1
+  fi
+
+  local repo_url="$PIVM_GSTACK_REPO_URL"
+  local repo_branch="$PIVM_GSTACK_REPO_BRANCH"
+  local repo_dir="$PIVM_GSTACK_REPO_DIR"
+  local port_dir="$repo_dir/$PIVM_GSTACK_PORT_SUBDIR"
+
+  mkdir -p "$(dirname "$repo_dir")"
+
+  if [[ -d "$repo_dir/.git" ]]; then
+    msg "Updating gstack port repo: $repo_dir" >&2
+    if ! (
+      cd "$repo_dir" &&
+      git fetch --depth 1 origin "$repo_branch" >&2 &&
+      git checkout "$repo_branch" >&2 &&
+      git reset --hard "origin/$repo_branch" >&2
+    ); then
+      msg "Warning: failed to update gstack repo at $repo_dir; using cached copy." >&2
+    fi
+  else
+    msg "Cloning gstack port repo: $repo_url ($repo_branch)" >&2
+    rm -rf "$repo_dir"
+    if ! git clone --depth 1 --branch "$repo_branch" "$repo_url" "$repo_dir" >&2; then
+      msg "Failed to clone gstack repo from $repo_url. Skipping gstack sync." >&2
+      return 1
+    fi
+  fi
+
+  if [[ ! -f "$port_dir/SKILL.md" && -f "$repo_dir/scripts/sync_from_upstream.py" ]]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+      msg "python3 is required to generate gstack port content at $port_dir. Skipping gstack sync." >&2
+      return 1
+    fi
+
+    msg "Generating gstack port in repo clone..." >&2
+    if ! (cd "$repo_dir" && python3 scripts/sync_from_upstream.py >&2); then
+      msg "Failed to generate gstack port in $repo_dir. Skipping gstack sync." >&2
+      return 1
+    fi
+  fi
+
+  if [[ ! -f "$port_dir/SKILL.md" ]]; then
+    msg "gstack port not found at $port_dir. Set PIVM_GSTACK_PORT_DIR or check repo layout." >&2
+    return 1
+  fi
+
+  printf '%s\n' "$port_dir"
+}
+
 sync_gstack_port() {
   [[ "$PIVM_SYNC_GSTACK" = "1" ]] || return 0
 
-  local src="$PIVM_GSTACK_PORT_DIR"
-  if [[ ! -f "$src/SKILL.md" ]]; then
-    msg "gstack port not found at $src (set PIVM_GSTACK_PORT_DIR). Skipping gstack sync."
+  local src=""
+  if ! src="$(resolve_gstack_port_source)"; then
     return 0
   fi
 
@@ -445,6 +991,7 @@ run_pi() {
   remote_cmd+="if command -v npm >/dev/null 2>&1; then npm install -g @mariozechner/pi-coding-agent@latest >/dev/null 2>&1 || true; fi; "
   remote_cmd+="exec pi"
 
+  local arg
   for arg in "$@"; do
     remote_cmd+=" $(printf '%q' "$arg")"
   done
@@ -506,43 +1053,65 @@ status_vm() {
     local pid
     pid="$(cat "$PID_FILE")"
     echo "running"
+    echo "  session: $SESSION_NAME"
     echo "  pid: $pid"
     echo "  ssh: ${SSH_USER}@127.0.0.1:${port}"
     echo "  workspace: $HOST_WORKSPACE -> ${GUEST_WORKSPACE}"
+    echo "  state dir: $STATE_DIR"
   else
     echo "stopped"
+    echo "  session: $SESSION_NAME"
     echo "  configured ssh port: $port"
     echo "  workspace: $HOST_WORKSPACE -> ${GUEST_WORKSPACE}"
+    echo "  state dir: $STATE_DIR"
   fi
 }
 
 usage() {
   cat <<EOF
 Usage:
-  ./pivm                 # Start/resume VM and run pi inside it
-  ./pivm [pi args...]    # Pass args to pi (inside VM)
+  ./pivm                          # Choose resume/new session, then run pi
+  ./pivm [pi args...]             # Pass args to pi (inside selected VM)
 
-  ./pivm init            # One-time image/disk/cloud-init setup
-  ./pivm start           # Start VM only
-  ./pivm ssh             # Open interactive shell in VM
-  ./pivm status          # Show VM status
-  ./pivm stop            # Stop VM
+Session commands:
+  ./pivm new [name] [-- pi args]      # Create a new session VM and run pi
+  ./pivm resume [name] [-- pi args]   # Resume an existing session VM and run pi
+  ./pivm sessions                      # List all sessions
+
+VM management:
+  ./pivm init [session]          # One-time setup for a session
+  ./pivm start [session]         # Start session VM only
+  ./pivm ssh [session]           # Open interactive shell in session VM
+  ./pivm status [session]        # Show one session, or all sessions if omitted
+  ./pivm stop [session]          # Stop one session VM
+  ./pivm stop --all              # Stop all session VMs
+
+Run mode flags (for default ./pivm run):
+  --new                          # Start a new session VM
+  --resume [session]             # Resume a session (default: last/running)
+  --session <session>            # Explicit session to resume or create
 
 Environment overrides:
-  PIVM_STATE_DIR, PIVM_HOST_WORKSPACE, PIVM_SSH_PORT,
-  PIVM_CPUS, PIVM_MEM_MB, PIVM_DISK_SIZE, PIVM_IMAGE_URL
+  PIVM_STATE_HOME, PIVM_STATE_ROOT, PIVM_STATE_DIR, PIVM_SESSION,
+  PIVM_LAST_SESSION_FILE, PIVM_HOST_WORKSPACE, PIVM_SSH_PORT,
+  PIVM_CPUS, PIVM_MEM_MB, PIVM_DISK_SIZE, PIVM_IMAGE_URL,
+  PIVM_BASE_IMAGE_FILE
 
 Pi customization:
-  PIVM_PI_EXTENSION_SOURCES   Colon-separated extension files/dirs to sync (default: $SCRIPT_DIR/extensions)
-  PIVM_SYNC_GSTACK            1/0 sync local gstack port into ~/.pi/agent/skills (default: 1)
-  PIVM_GSTACK_PORT_DIR        Host path to gstack port (default: ~/gstack-pi-port/port/gstack)
-  PIVM_GSTACK_BUILD           1/0 run gstack ./setup inside VM after sync (default: 0)
+  PIVM_PI_EXTENSION_SOURCES      Colon-separated extension files/dirs to sync (default: $SCRIPT_DIR/extensions)
+  PIVM_SYNC_GSTACK               1/0 sync gstack port into ~/.pi/agent/skills (default: 1)
+  PIVM_GSTACK_PORT_DIR           Optional host path to prebuilt gstack port (contains SKILL.md)
+  PIVM_GSTACK_REPO_URL           Repo URL to clone/pull when PORT_DIR unset/invalid (default: $PIVM_GSTACK_REPO_URL)
+  PIVM_GSTACK_REPO_BRANCH        Repo branch for gstack port repo sync (default: $PIVM_GSTACK_REPO_BRANCH)
+  PIVM_GSTACK_REPO_DIR           Local cache dir for cloned gstack port repo (default: $PIVM_GSTACK_REPO_DIR)
+  PIVM_GSTACK_PORT_SUBDIR        Port subdir inside cloned repo (default: $PIVM_GSTACK_PORT_SUBDIR)
+  PIVM_GSTACK_BUILD              1/0 run gstack ./setup inside VM after sync (default: 0)
 
 Clipboard bridge for /paste:
-  PIVM_SYNC_HOST_CLIPBOARD    1/0 snapshot host clipboard before launch (default: 1)
-  PIVM_CLIPBOARD_SOURCE_CMD   Optional command to read host clipboard text
-  PIVM_CLIPBOARD_SNAPSHOT_FILE Host-side snapshot path (default: $STATE_DIR/host-clipboard.txt)
-  PIVM_GUEST_CLIPBOARD_FILE   Guest path exposed as PIVM_CLIPBOARD_FILE (default: /home/$SSH_USER/.pivm/host-clipboard.txt)
+  PIVM_SYNC_HOST_CLIPBOARD       1/0 snapshot host clipboard before launch (default: 1)
+  PIVM_CLIPBOARD_SOURCE_CMD      Optional command to read host clipboard text
+  PIVM_CLIPBOARD_SNAPSHOT_FILE   Host-side snapshot path (default: session-state/host-clipboard.txt)
+  PIVM_GUEST_CLIPBOARD_FILE      Guest path exposed as PIVM_CLIPBOARD_FILE (default: /home/$SSH_USER/.pivm/host-clipboard.txt)
 EOF
 }
 
@@ -551,7 +1120,7 @@ main() {
 
   if [[ $# -gt 0 ]]; then
     case "$1" in
-      init|start|stop|status|ssh|help|-h|--help)
+      init|start|stop|status|ssh|new|resume|sessions|list|help|-h|--help)
         subcmd="$1"
         shift
         ;;
@@ -559,10 +1128,51 @@ main() {
   fi
 
   case "$subcmd" in
+    new)
+      local requested_session=""
+      if [[ $# -gt 0 ]] && [[ "$1" != "--" ]] && [[ "$1" != -* ]]; then
+        requested_session="$1"
+        shift
+      fi
+      if [[ $# -gt 0 ]] && [[ "$1" == "--" ]]; then
+        shift
+      fi
+      resolve_run_session "new" "$requested_session"
+      run_pi "$@"
+      ;;
+
+    resume)
+      local requested_session=""
+      if [[ $# -gt 0 ]] && [[ "$1" != "--" ]] && [[ "$1" != -* ]]; then
+        requested_session="$1"
+        shift
+      fi
+      if [[ $# -gt 0 ]] && [[ "$1" == "--" ]]; then
+        shift
+      fi
+      resolve_run_session "resume" "$requested_session"
+      run_pi "$@"
+      ;;
+
+    sessions|list)
+      list_sessions_overview
+      ;;
+
     init)
+      local target_session="${1:-}"
+      if [[ $# -gt 0 ]]; then
+        shift
+      fi
+      resolve_command_session "init" "$target_session"
       init_vm
       ;;
+
     start)
+      local target_session="${1:-}"
+      if [[ $# -gt 0 ]]; then
+        shift
+      fi
+      resolve_command_session "start" "$target_session"
       init_vm
       start_vm
       wait_for_ssh
@@ -572,21 +1182,85 @@ main() {
       provision_pi_customizations
       msg "VM ready."
       ;;
+
     stop)
-      stop_vm
+      if [[ "${1:-}" == "--all" ]]; then
+        shift
+        stop_all_sessions
+      else
+        local target_session="${1:-}"
+        if [[ $# -gt 0 ]]; then
+          shift
+        fi
+        resolve_command_session "stop" "$target_session"
+        stop_vm
+      fi
       ;;
+
     status)
-      status_vm
+      if [[ $# -gt 0 ]]; then
+        local target_session="$1"
+        shift
+        resolve_command_session "status" "$target_session"
+        status_vm
+      else
+        list_sessions_overview
+      fi
       ;;
+
     ssh)
+      local target_session="${1:-}"
+      if [[ $# -gt 0 ]]; then
+        shift
+      fi
+      resolve_command_session "ssh" "$target_session"
       open_shell
       ;;
+
     help|-h|--help)
       usage
       ;;
+
     run)
+      local run_mode="auto"
+      local requested_session="${PIVM_SESSION:-}"
+
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --new)
+            run_mode="new"
+            requested_session=""
+            shift
+            ;;
+          --resume)
+            run_mode="resume"
+            shift
+            if [[ $# -gt 0 ]] && [[ "$1" != "--" ]] && [[ "$1" != -* ]]; then
+              requested_session="$1"
+              shift
+            fi
+            ;;
+          --session)
+            run_mode="auto"
+            shift
+            [[ $# -gt 0 ]] || die "--session requires a session name"
+            requested_session="$1"
+            shift
+            ;;
+          --)
+            shift
+            break
+            ;;
+          *)
+            break
+            ;;
+        esac
+      done
+
+      resolve_run_session "$run_mode" "$requested_session"
       run_pi "$@"
       ;;
+
     *)
       die "Unknown command: $subcmd"
       ;;
