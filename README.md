@@ -18,6 +18,30 @@
 - Ensures latest `pi` version in VM (`npm i -g @mariozechner/pi-coding-agent@latest`)
 - Runs `pi` in the VM with interactive TTY
 
+## Host compatibility
+
+- **Linux:** supported (uses KVM when available)
+- **macOS:** supported (uses HVF when available, otherwise TCG)
+- Guest image remains Ubuntu (`noble-server-cloudimg-amd64`) on both
+
+Required host tools:
+
+- `qemu-system-x86_64`
+- `qemu-img`
+- `ssh`
+- `ssh-keygen`
+- `curl`
+- `rsync`
+- `genisoimage` **or** `mkisofs`
+
+macOS example (Homebrew):
+
+```bash
+brew install qemu cdrtools rsync gh
+```
+
+> On Apple Silicon, x86_64 Ubuntu may run in software emulation depending on your QEMU/HVF setup, so it can be slower than Linux+KVM.
+
 ## Usage
 
 From this folder:
@@ -166,5 +190,6 @@ You can copy built-in examples from:
 ## Notes
 
 - First run can take several minutes (cloud image + package bootstrap).
+- One script handles both Linux and macOS host behavior (no separate launcher needed right now).
 - If you want this tied to another repo/folder, copy `pivm` into that folder (or set `PIVM_HOST_WORKSPACE`).
 - For full options, run `./pivm help`.

@@ -21,6 +21,11 @@ CPUS="${PIVM_CPUS:-4}"
 MEM_MB="${PIVM_MEM_MB:-8192}"
 DISK_SIZE="${PIVM_DISK_SIZE:-80G}"
 
+HOST_OS="$(uname -s 2>/dev/null || echo unknown)"
+QEMU_BIN="${PIVM_QEMU_BIN:-qemu-system-x86_64}"
+PIVM_QEMU_ACCEL="${PIVM_QEMU_ACCEL:-}"
+PIVM_QEMU_CPU="${PIVM_QEMU_CPU:-}"
+
 PI_AGENT_DIR="/home/${SSH_USER}/.pi/agent"
 PI_EXTENSIONS_DIR="${PI_AGENT_DIR}/extensions"
 PI_SKILLS_DIR="${PI_AGENT_DIR}/skills"
@@ -51,6 +56,7 @@ PORT_FILE=""
 PID_FILE=""
 LOG_FILE=""
 CLIPBOARD_SNAPSHOT_FILE=""
+ISO_TOOL=""
 
 msg() {
   if [[ -n "${SESSION_NAME:-}" ]]; then
@@ -69,14 +75,57 @@ need() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required tool: $1"
 }
 
+detect_iso_tool() {
+  if command -v genisoimage >/dev/null 2>&1; then
+    ISO_TOOL="genisoimage"
+    return
+  fi
+
+  if command -v mkisofs >/dev/null 2>&1; then
+    ISO_TOOL="mkisofs"
+    return
+  fi
+
+  die "Missing required tool: genisoimage or mkisofs"
+}
+
+qemu_supports_accel() {
+  local accel="$1"
+  "$QEMU_BIN" -accel help 2>/dev/null | grep -Eq "(^|[[:space:]])${accel}([[:space:]]|$)"
+}
+
+detect_qemu_runtime() {
+  local accel cpu
+
+  if [[ -n "$PIVM_QEMU_ACCEL" ]]; then
+    accel="$PIVM_QEMU_ACCEL"
+  elif [[ "$HOST_OS" == "Linux" ]] && [[ -r /dev/kvm && -w /dev/kvm ]] && qemu_supports_accel kvm; then
+    accel="kvm"
+  elif [[ "$HOST_OS" == "Darwin" ]] && qemu_supports_accel hvf; then
+    accel="hvf"
+  else
+    accel="tcg"
+  fi
+
+  if [[ -n "$PIVM_QEMU_CPU" ]]; then
+    cpu="$PIVM_QEMU_CPU"
+  elif [[ "$accel" == "kvm" ]]; then
+    cpu="host"
+  else
+    cpu="max"
+  fi
+
+  printf '%s %s\n' "$accel" "$cpu"
+}
+
 require_tools() {
-  need qemu-system-x86_64
+  need "$QEMU_BIN"
   need qemu-img
   need ssh
   need ssh-keygen
-  need genisoimage
   need curl
   need rsync
+  detect_iso_tool
 }
 
 is_valid_session_name() {
@@ -117,10 +166,11 @@ all_session_names() {
   local names=()
 
   if [[ -d "$STATE_ROOT" ]]; then
-    while IFS= read -r name; do
-      [[ -n "$name" ]] || continue
-      names+=("$name")
-    done < <(find "$STATE_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
+    local dir
+    for dir in "$STATE_ROOT"/*; do
+      [[ -d "$dir" ]] || continue
+      names+=("$(basename "$dir")")
+    done
   fi
 
   if legacy_layout_exists && [[ ! -d "$STATE_ROOT/default" ]]; then
@@ -260,9 +310,11 @@ prompt_resume_or_new() {
     return
   fi
 
-  local answer
+  local answer answer_lc
   read -r -p "Resume existing session (${default_session}) or start a new one? [R/n]: " answer
-  case "${answer,,}" in
+  answer_lc="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
+
+  case "$answer_lc" in
     n|new)
       echo "new"
       ;;
@@ -276,7 +328,11 @@ choose_existing_session_interactive() {
   local default_session="$1"
 
   local sessions=()
-  mapfile -t sessions < <(all_session_names)
+  local session
+  while IFS= read -r session; do
+    [[ -n "$session" ]] || continue
+    sessions+=("$session")
+  done < <(all_session_names)
 
   ((${#sessions[@]} > 0)) || return 1
 
@@ -285,7 +341,6 @@ choose_existing_session_interactive() {
 
   echo "Available pivm sessions:"
   local idx=1
-  local session
   for session in "${sessions[@]}"; do
     local status marker
     status="stopped"
@@ -386,7 +441,11 @@ resolve_run_session() {
         chosen="$SESSION_NAME"
       else
         local sessions=()
-        mapfile -t sessions < <(all_session_names)
+        local session
+        while IFS= read -r session; do
+          [[ -n "$session" ]] || continue
+          sessions+=("$session")
+        done < <(all_session_names)
 
         if ((${#sessions[@]} == 0)); then
           chosen="$(generate_session_name)"
@@ -482,7 +541,11 @@ list_sessions_overview() {
   mkdir -p "$STATE_HOME" "$STATE_ROOT"
 
   local sessions=()
-  mapfile -t sessions < <(all_session_names)
+  local session
+  while IFS= read -r session; do
+    [[ -n "$session" ]] || continue
+    sessions+=("$session")
+  done < <(all_session_names)
 
   if ((${#sessions[@]} == 0)); then
     echo "No pivm sessions yet. Start one with './pivm new' or just './pivm'."
@@ -493,7 +556,6 @@ list_sessions_overview() {
   last_session="$(load_last_session)"
 
   echo "pivm sessions:"
-  local session
   for session in "${sessions[@]}"; do
     local state_dir status port marker
     state_dir="$(session_state_dir "$session")"
@@ -523,14 +585,17 @@ stop_all_sessions() {
   fi
 
   local sessions=()
-  mapfile -t sessions < <(all_session_names)
+  local session
+  while IFS= read -r session; do
+    [[ -n "$session" ]] || continue
+    sessions+=("$session")
+  done < <(all_session_names)
 
   if ((${#sessions[@]} == 0)); then
     msg "No sessions to stop."
     return
   fi
 
-  local session
   for session in "${sessions[@]}"; do
     configure_state_for_session "$session"
     stop_vm
@@ -679,7 +744,7 @@ instance-id: ${VM_NAME}
 local-hostname: ${VM_NAME}
 EOF
 
-  genisoimage -quiet -output "$SEED_ISO" -volid cidata -joliet -rock "$USER_DATA" "$META_DATA"
+  "$ISO_TOOL" -quiet -o "$SEED_ISO" -volid cidata -joliet -rock "$USER_DATA" "$META_DATA"
 }
 
 create_vm_disk() {
@@ -708,20 +773,15 @@ start_vm() {
     return
   fi
 
-  local accel cpu ssh_port
+  local accel cpu ssh_port runtime
   ssh_port="$(load_ssh_port)"
+  runtime="$(detect_qemu_runtime)"
+  accel="${runtime%% *}"
+  cpu="${runtime#* }"
 
-  if [[ -r /dev/kvm && -w /dev/kvm ]]; then
-    accel="kvm"
-    cpu="host"
-  else
-    accel="tcg"
-    cpu="max"
-  fi
+  msg "Starting VM (ssh on 127.0.0.1:${ssh_port}, accel=${accel}, cpu=${cpu})..."
 
-  msg "Starting VM (ssh on 127.0.0.1:${ssh_port})..."
-
-  qemu-system-x86_64 \
+  "$QEMU_BIN" \
     -name "$VM_NAME" \
     -machine "q35,accel=${accel}" \
     -cpu "$cpu" \
@@ -1095,7 +1155,7 @@ Environment overrides:
   PIVM_STATE_HOME, PIVM_STATE_ROOT, PIVM_STATE_DIR, PIVM_SESSION,
   PIVM_LAST_SESSION_FILE, PIVM_HOST_WORKSPACE, PIVM_SSH_PORT,
   PIVM_CPUS, PIVM_MEM_MB, PIVM_DISK_SIZE, PIVM_IMAGE_URL,
-  PIVM_BASE_IMAGE_FILE
+  PIVM_BASE_IMAGE_FILE, PIVM_QEMU_BIN, PIVM_QEMU_ACCEL, PIVM_QEMU_CPU
 
 Pi customization:
   PIVM_PI_EXTENSION_SOURCES      Colon-separated extension files/dirs to sync (default: $SCRIPT_DIR/extensions)
