@@ -1,4 +1,4 @@
-# pivm PoC
+# pivm
 
 `pivm` runs `pi` inside local QEMU VMs while keeping usage close to host UX.
 
