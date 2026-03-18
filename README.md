@@ -26,6 +26,8 @@
 
 Required host tools:
 
+- `pi`
+- `gh`
 - `qemu-system-x86_64`
 - `qemu-img`
 - `ssh`
