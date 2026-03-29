@@ -16,6 +16,7 @@
 - Optionally snapshots host clipboard into VM for `/paste` fallback
 - Exposes host GitHub auth to VM via `GH_TOKEN="$(gh auth token)"`
 - Ensures latest `pi` version in VM (`npm i -g @mariozechner/pi-coding-agent@latest`)
+- Configures npm global installs to a user-writable prefix (`~/.npm-global`) to avoid EACCES
 - Runs `pi` in the VM with interactive TTY
 
 ## Host compatibility

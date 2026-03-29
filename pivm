@@ -12,6 +12,8 @@ SESSION_NAME="${PIVM_SESSION:-}"
 HOST_WORKSPACE="${PIVM_HOST_WORKSPACE:-$SCRIPT_DIR}"
 HOST_WORKSPACE="$(cd -- "$HOST_WORKSPACE" && pwd)"
 GUEST_WORKSPACE="/workspace"
+GUEST_WORKSPACE_FS_TYPE="9p"
+GUEST_WORKSPACE_MOUNT_OPTS="trans=virtio,version=9p2000.L,msize=104857600,rw,_netdev"
 
 IMAGE_URL="${PIVM_IMAGE_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img}"
 BASE_IMAGE_OVERRIDE="${PIVM_BASE_IMAGE_FILE:-}"
@@ -29,6 +31,8 @@ PIVM_QEMU_CPU="${PIVM_QEMU_CPU:-}"
 PI_AGENT_DIR="/home/${SSH_USER}/.pi/agent"
 PI_EXTENSIONS_DIR="${PI_AGENT_DIR}/extensions"
 PI_SKILLS_DIR="${PI_AGENT_DIR}/skills"
+NPM_GLOBAL_PREFIX="/home/${SSH_USER}/.npm-global"
+NPM_GLOBAL_BIN="${NPM_GLOBAL_PREFIX}/bin"
 
 PIVM_PI_EXTENSION_SOURCES="${PIVM_PI_EXTENSION_SOURCES:-$SCRIPT_DIR/extensions}"
 PIVM_SYNC_GSTACK="${PIVM_SYNC_GSTACK:-1}"
@@ -732,7 +736,7 @@ packages:
   - build-essential
 runcmd:
   - mkdir -p ${GUEST_WORKSPACE}
-  - grep -q '^workspace ${GUEST_WORKSPACE} 9p' /etc/fstab || echo 'workspace ${GUEST_WORKSPACE} 9p trans=virtio,version=9p2000.L,msize=104857600,rw,_netdev 0 0' >> /etc/fstab
+  - grep -q '^workspace ${GUEST_WORKSPACE} ${GUEST_WORKSPACE_FS_TYPE}' /etc/fstab || echo 'workspace ${GUEST_WORKSPACE} ${GUEST_WORKSPACE_FS_TYPE} ${GUEST_WORKSPACE_MOUNT_OPTS} 0 0' >> /etc/fstab
   - mount -a || true
   - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
   - apt-get install -y nodejs
@@ -993,7 +997,12 @@ sync_gstack_port() {
   fi
 }
 
+ensure_guest_npm_prefix() {
+  ssh_cmd "bash -lc 'if command -v npm >/dev/null 2>&1; then mkdir -p ${NPM_GLOBAL_BIN}; npm config set prefix ${NPM_GLOBAL_PREFIX} >/dev/null 2>&1 || true; fi'"
+}
+
 provision_pi_customizations() {
+  ensure_guest_npm_prefix
   snapshot_host_clipboard
   sync_clipboard_snapshot
   sync_pi_extensions
@@ -1001,7 +1010,46 @@ provision_pi_customizations() {
 }
 
 ensure_guest_workspace_mount() {
-  ssh_cmd "bash -lc 'sudo mkdir -p ${GUEST_WORKSPACE}; sudo mount -a >/dev/null 2>&1 || true'"
+  msg "Ensuring ${GUEST_WORKSPACE} is mounted and writable..."
+
+  local remote_script
+  remote_script="$(cat <<EOF
+set -euo pipefail
+
+sudo mkdir -p ${GUEST_WORKSPACE}
+
+if grep -Eq '^workspace[[:space:]]+${GUEST_WORKSPACE}[[:space:]]+${GUEST_WORKSPACE_FS_TYPE}[[:space:]]' /etc/fstab; then
+  sudo sed -i 's|^workspace[[:space:]]\\+${GUEST_WORKSPACE}[[:space:]]\\+${GUEST_WORKSPACE_FS_TYPE}[[:space:]].*|workspace ${GUEST_WORKSPACE} ${GUEST_WORKSPACE_FS_TYPE} ${GUEST_WORKSPACE_MOUNT_OPTS} 0 0|' /etc/fstab
+else
+  echo 'workspace ${GUEST_WORKSPACE} ${GUEST_WORKSPACE_FS_TYPE} ${GUEST_WORKSPACE_MOUNT_OPTS} 0 0' | sudo tee -a /etc/fstab >/dev/null
+fi
+
+sudo mount ${GUEST_WORKSPACE} >/dev/null 2>&1 || sudo mount -a >/dev/null 2>&1 || true
+
+if ! mountpoint -q ${GUEST_WORKSPACE}; then
+  echo 'pivm: ${GUEST_WORKSPACE} did not mount' >&2
+  exit 1
+fi
+
+fstype=\$(findmnt -n -o FSTYPE --target ${GUEST_WORKSPACE} 2>/dev/null || true)
+if [[ "\$fstype" != '${GUEST_WORKSPACE_FS_TYPE}' ]]; then
+  echo "pivm: ${GUEST_WORKSPACE} mounted as '\${fstype:-unknown}', expected ${GUEST_WORKSPACE_FS_TYPE}" >&2
+  exit 1
+fi
+
+probe='${GUEST_WORKSPACE}/.pivm-write-check-'\$\$'-'\$RANDOM
+if ! touch "\$probe" >/dev/null 2>&1; then
+  mount_info=\$(findmnt -n -o SOURCE,FSTYPE,OPTIONS,TARGET --target ${GUEST_WORKSPACE} 2>/dev/null || true)
+  echo "pivm: ${GUEST_WORKSPACE} is mounted but not writable for \$(id -un)." >&2
+  [[ -n "\$mount_info" ]] && echo "pivm: mount info: \$mount_info" >&2
+  exit 1
+fi
+
+rm -f "\$probe" >/dev/null 2>&1 || true
+EOF
+)"
+
+  ssh_cmd "bash -lc $(printf '%q' "$remote_script")"
 }
 
 guest_cwd_from_host_pwd() {
@@ -1056,9 +1104,9 @@ run_pi() {
     remote_cmd+=" $(printf '%q' "$arg")"
   done
 
-  env_prefix=""
+  env_prefix="export NPM_CONFIG_PREFIX=$(printf '%q' "$NPM_GLOBAL_PREFIX"); export PATH=$(printf '%q' "$NPM_GLOBAL_BIN"):\$PATH; "
   if [[ -n "$gh_token" ]]; then
-    env_prefix="export GH_TOKEN=$(printf '%q' "$gh_token"); export GITHUB_TOKEN=$(printf '%q' "$gh_token"); "
+    env_prefix+="export GH_TOKEN=$(printf '%q' "$gh_token"); export GITHUB_TOKEN=$(printf '%q' "$gh_token"); "
   else
     msg "Warning: could not resolve GH token from host (gh auth token / env)."
   fi
@@ -1076,7 +1124,7 @@ open_shell() {
   ensure_guest_workspace_mount
   sync_pi_agent
   provision_pi_customizations
-  ssh_tty "bash -lc 'cd ${GUEST_WORKSPACE}; exec bash -l'"
+  ssh_tty "bash -lc 'export NPM_CONFIG_PREFIX=${NPM_GLOBAL_PREFIX}; export PATH=${NPM_GLOBAL_BIN}:\$PATH; cd ${GUEST_WORKSPACE}; exec bash -l'"
 }
 
 stop_vm() {
