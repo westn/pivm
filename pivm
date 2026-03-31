@@ -1031,9 +1031,10 @@ if ! mountpoint -q ${GUEST_WORKSPACE}; then
   exit 1
 fi
 
-fstype=\$(findmnt -n -o FSTYPE --target ${GUEST_WORKSPACE} 2>/dev/null || true)
-if [[ "\$fstype" != '${GUEST_WORKSPACE_FS_TYPE}' ]]; then
-  echo "pivm: ${GUEST_WORKSPACE} mounted as '\${fstype:-unknown}', expected ${GUEST_WORKSPACE_FS_TYPE}" >&2
+fstypes=\$(findmnt -n -o FSTYPE --target ${GUEST_WORKSPACE} 2>/dev/null || true)
+if ! printf '%s\n' "\$fstypes" | grep -Fxq '${GUEST_WORKSPACE_FS_TYPE}'; then
+  fstype_display=\$(printf '%s' "\${fstypes:-unknown}" | tr '\n' ' ')
+  echo "pivm: ${GUEST_WORKSPACE} mounted as '\${fstype_display:-unknown}', expected ${GUEST_WORKSPACE_FS_TYPE}" >&2
   exit 1
 fi
 
