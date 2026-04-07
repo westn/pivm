@@ -990,8 +990,7 @@ sync_gstack_port() {
     -e "$(rsync_ssh_cmd)" \
     "$src/" "${SSH_USER}@127.0.0.1:${PI_SKILLS_DIR}/gstack/"
 
-  local link_script
-  link_script="$(cat <<EOF
+  ssh_cmd "bash -s" <<EOF
 set -euo pipefail
 SK="${PI_SKILLS_DIR}"
 declare -A chosen
@@ -1042,9 +1041,6 @@ for name in "\${!chosen[@]}"; do
   ln -snf "gstack/\$base" "\$SK/\$name"
 done
 EOF
-)"
-
-  ssh_cmd "bash -lc $(printf '%q' "$link_script")"
 
   if [[ "$PIVM_GSTACK_BUILD" = "1" ]]; then
     msg "Building gstack browse runtime in VM..."
@@ -1059,8 +1055,7 @@ ensure_guest_npm_prefix() {
 update_guest_npm_packages() {
   [[ "$PIVM_AUTO_UPDATE_NPM_PACKAGES" = "1" ]] || return 0
 
-  local update_script
-  update_script="$(cat <<EOF
+  ssh_cmd "bash -s" <<EOF
 set -euo pipefail
 
 SETTINGS="/home/${SSH_USER}/.pi/agent/settings.json"
@@ -1074,9 +1069,6 @@ while IFS= read -r pkg; do
   pi update "\$pkg" >/dev/null 2>&1 || true
 done < <(jq -r '.packages[]? | select(type == "string" and startswith("npm:"))' "\$SETTINGS" 2>/dev/null)
 EOF
-)"
-
-  ssh_cmd "bash -lc $(printf '%q' "$update_script")"
 }
 
 provision_pi_customizations() {
