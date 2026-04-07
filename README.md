@@ -12,7 +12,8 @@
 - Syncs host `~/.pi/agent` (excluding sessions/cache) into VM
 - Syncs local pi extensions from `./extensions` into VM (`~/.pi/agent/extensions`)
 - Ships a built-in `/paste` extension (`extensions/paste.ts`)
-- Syncs gstack pi-port into VM (`~/.pi/agent/skills/gstack`) from a repo cache (auto clone/pull) and creates top-level skill symlinks
+- Syncs gstack pi-port into VM (`~/.pi/agent/skills/gstack`) from a repo cache (auto clone/pull) and creates canonical top-level skill symlinks (deduped by `name:` in `SKILL.md`)
+- Auto-updates `npm:` pi packages from `~/.pi/agent/settings.json` in VM to avoid update nags (`PIVM_AUTO_UPDATE_NPM_PACKAGES=0` to disable)
 - Optionally snapshots host clipboard into VM for `/paste` fallback
 - Exposes host GitHub auth to VM via `GH_TOKEN="$(gh auth token)"`
 - Ensures latest `pi` version in VM (`npm i -g @mariozechner/pi-coding-agent@latest`)
@@ -142,6 +143,12 @@ Run gstack `./setup` in VM after sync (build browse runtime):
 
 ```bash
 export PIVM_GSTACK_BUILD=1
+```
+
+Disable automatic `pi update` for `npm:` packages listed in `~/.pi/agent/settings.json`:
+
+```bash
+export PIVM_AUTO_UPDATE_NPM_PACKAGES=0
 ```
 
 ## `/paste` extension

@@ -42,6 +42,7 @@ PIVM_GSTACK_REPO_BRANCH="${PIVM_GSTACK_REPO_BRANCH:-main}"
 PIVM_GSTACK_REPO_DIR="${PIVM_GSTACK_REPO_DIR:-$STATE_HOME/sources/gstack-pi-port}"
 PIVM_GSTACK_PORT_SUBDIR="${PIVM_GSTACK_PORT_SUBDIR:-port/gstack}"
 PIVM_GSTACK_BUILD="${PIVM_GSTACK_BUILD:-0}"
+PIVM_AUTO_UPDATE_NPM_PACKAGES="${PIVM_AUTO_UPDATE_NPM_PACKAGES:-1}"
 
 PIVM_SYNC_HOST_CLIPBOARD="${PIVM_SYNC_HOST_CLIPBOARD:-1}"
 PIVM_CLIPBOARD_SNAPSHOT_FILE_OVERRIDE="${PIVM_CLIPBOARD_SNAPSHOT_FILE:-}"
@@ -989,7 +990,61 @@ sync_gstack_port() {
     -e "$(rsync_ssh_cmd)" \
     "$src/" "${SSH_USER}@127.0.0.1:${PI_SKILLS_DIR}/gstack/"
 
-  ssh_cmd "bash -lc 'set -e; SK=${PI_SKILLS_DIR}; for d in \"\$SK\"/gstack/*/; do [ -f \"\$d/SKILL.md\" ] || continue; n=\$(basename \"\$d\"); [ \"\$n\" = \"node_modules\" ] && continue; ln -snf \"gstack/\$n\" \"\$SK/\$n\"; done'"
+  local link_script
+  link_script="$(cat <<EOF
+set -euo pipefail
+SK="${PI_SKILLS_DIR}"
+declare -A chosen
+
+for d in "\$SK"/gstack/*/; do
+  [ -d "\$d" ] || continue
+  [ -f "\$d/SKILL.md" ] || continue
+
+  base=\$(basename "\$d")
+  [ "\$base" = "node_modules" ] && continue
+
+  name=\$(awk '
+    BEGIN { in_frontmatter = 0 }
+    /^---[[:space:]]*$/ {
+      if (in_frontmatter) exit
+      in_frontmatter = 1
+      next
+    }
+    in_frontmatter && /^name:[[:space:]]*/ {
+      sub(/^name:[[:space:]]*/, "", \$0)
+      gsub(/^"/, "", \$0)
+      gsub(/"$/, "", \$0)
+      gsub(/[[:space:]]+$/, "", \$0)
+      print \$0
+      exit
+    }
+  ' "\$d/SKILL.md")
+
+  [ -n "\$name" ] || name="\$base"
+
+  if [[ -z "\${chosen[\$name]+x}" || "\$base" == "\$name" ]]; then
+    chosen["\$name"]="\$base"
+  fi
+done
+
+for path in "\$SK"/*; do
+  [ -L "\$path" ] || continue
+  target=\$(readlink "\$path" || true)
+  case "\$target" in
+    gstack/*)
+      rm -f "\$path"
+      ;;
+  esac
+done
+
+for name in "\${!chosen[@]}"; do
+  base="\${chosen[\$name]}"
+  ln -snf "gstack/\$base" "\$SK/\$name"
+done
+EOF
+)"
+
+  ssh_cmd "bash -lc $(printf '%q' "$link_script")"
 
   if [[ "$PIVM_GSTACK_BUILD" = "1" ]]; then
     msg "Building gstack browse runtime in VM..."
@@ -1001,12 +1056,36 @@ ensure_guest_npm_prefix() {
   ssh_cmd "bash -lc 'if command -v npm >/dev/null 2>&1; then mkdir -p ${NPM_GLOBAL_BIN}; npm config set prefix ${NPM_GLOBAL_PREFIX} >/dev/null 2>&1 || true; fi'"
 }
 
+update_guest_npm_packages() {
+  [[ "$PIVM_AUTO_UPDATE_NPM_PACKAGES" = "1" ]] || return 0
+
+  local update_script
+  update_script="$(cat <<EOF
+set -euo pipefail
+
+SETTINGS="/home/${SSH_USER}/.pi/agent/settings.json"
+
+command -v pi >/dev/null 2>&1 || exit 0
+command -v jq >/dev/null 2>&1 || exit 0
+[ -f "\$SETTINGS" ] || exit 0
+
+while IFS= read -r pkg; do
+  [ -n "\$pkg" ] || continue
+  pi update "\$pkg" >/dev/null 2>&1 || true
+done < <(jq -r '.packages[]? | select(type == "string" and startswith("npm:"))' "\$SETTINGS" 2>/dev/null)
+EOF
+)"
+
+  ssh_cmd "bash -lc $(printf '%q' "$update_script")"
+}
+
 provision_pi_customizations() {
   ensure_guest_npm_prefix
   snapshot_host_clipboard
   sync_clipboard_snapshot
   sync_pi_extensions
   sync_gstack_port
+  update_guest_npm_packages
 }
 
 ensure_guest_workspace_mount() {
@@ -1215,6 +1294,7 @@ Pi customization:
   PIVM_GSTACK_REPO_DIR           Local cache dir for cloned gstack port repo (default: $PIVM_GSTACK_REPO_DIR)
   PIVM_GSTACK_PORT_SUBDIR        Port subdir inside cloned repo (default: $PIVM_GSTACK_PORT_SUBDIR)
   PIVM_GSTACK_BUILD              1/0 run gstack ./setup inside VM after sync (default: 0)
+  PIVM_AUTO_UPDATE_NPM_PACKAGES  1/0 auto-run 'pi update' for npm: packages from settings.json (default: 1)
 
 Clipboard bridge for /paste:
   PIVM_SYNC_HOST_CLIPBOARD       1/0 snapshot host clipboard before launch (default: 1)
