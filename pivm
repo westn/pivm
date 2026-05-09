@@ -1131,6 +1131,26 @@ open_shell() {
   ssh_tty "bash -lc 'cd ${GUEST_WORKSPACE}; exec bash -l'"
 }
 
+exec_guest_command() {
+  init_vm
+  start_vm
+  wait_for_ssh
+  wait_for_cloud_init
+  ensure_guest_workspace_mount
+  sync_pi_agent
+  provision_pi_customizations
+
+  local guest_dir remote_cmd
+  guest_dir="$(guest_cwd_from_host_pwd)"
+  remote_cmd="cd $(printf '%q' "$guest_dir"); "
+  if [[ $# -gt 0 ]]; then
+    remote_cmd+="$*"
+  else
+    remote_cmd+="exec bash -l"
+  fi
+  ssh_cmd "bash -lc $(printf '%q' "$remote_cmd")"
+}
+
 stop_vm() {
   cleanup_stale_pid
   if ! is_running; then
@@ -1194,6 +1214,7 @@ VM management:
   ./pivm init [session]          # One-time setup for a session
   ./pivm start [session]         # Start session VM only
   ./pivm ssh [session]           # Open interactive shell in session VM
+  ./pivm exec [session] -- <cmd>  # Run shell command in session VM
   ./pivm status [session]        # Show one session, or all sessions if omitted
   ./pivm stop [session]          # Stop one session VM
   ./pivm stop --all              # Stop all session VMs
@@ -1233,7 +1254,7 @@ main() {
 
   if [[ $# -gt 0 ]]; then
     case "$1" in
-      init|start|stop|status|ssh|new|resume|sessions|list|help|-h|--help)
+      init|start|stop|status|ssh|exec|new|resume|sessions|list|help|-h|--help)
         subcmd="$1"
         shift
         ;;
@@ -1328,6 +1349,20 @@ main() {
       fi
       resolve_command_session "ssh" "$target_session"
       open_shell
+      ;;
+
+    exec)
+      local target_session="${1:-}"
+      if [[ $# -gt 0 ]] && [[ "$1" != "--" ]]; then
+        shift
+      else
+        target_session=""
+      fi
+      if [[ $# -gt 0 ]] && [[ "$1" == "--" ]]; then
+        shift
+      fi
+      resolve_command_session "exec" "$target_session"
+      exec_guest_command "$@"
       ;;
 
     help|-h|--help)

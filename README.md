@@ -90,6 +90,7 @@ VM/session management:
 ./pivm init my-feature
 ./pivm start my-feature
 ./pivm ssh my-feature
+./pivm exec my-feature -- 'pwd && pi --version'
 ./pivm status
 ./pivm status my-feature
 ./pivm stop my-feature
