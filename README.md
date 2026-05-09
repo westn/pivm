@@ -11,6 +11,7 @@
 - Mounts this folder into VM at `/workspace`
 - Syncs host `~/.pi/agent` (excluding sessions/cache) into VM
 - Syncs local pi extensions from `./extensions` into VM (`~/.pi/agent/extensions`)
+- Optionally syncs extra pi skills into VM via `PIVM_PI_SKILL_SOURCES`
 - Ships a built-in `/paste` extension (`extensions/paste.ts`)
 - Syncs gstack pi-port into VM (`~/.pi/agent/skills/gstack`) from a repo cache (auto clone/pull) and creates top-level skill symlinks
 - Optionally snapshots host clipboard into VM for `/paste` fallback
@@ -142,6 +143,23 @@ Run gstack `./setup` in VM after sync (build browse runtime):
 ```bash
 export PIVM_GSTACK_BUILD=1
 ```
+
+## Project skill injection
+
+Use `PIVM_PI_SKILL_SOURCES` to sync project-local skills into the VM without installing them globally on the host:
+
+```bash
+export PIVM_PI_SKILL_SOURCES=/path/to/project/.pi/skills
+./pivm --session orkester-e2e
+```
+
+The value is colon-separated. Each entry may be:
+
+- a directory containing multiple skill folders
+- a single skill directory containing `SKILL.md`
+- a standalone markdown skill file
+
+Skills are copied to `~/.pi/agent/skills` in the guest before `pi` starts.
 
 ## `/paste` extension
 

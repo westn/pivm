@@ -31,6 +31,7 @@ PI_EXTENSIONS_DIR="${PI_AGENT_DIR}/extensions"
 PI_SKILLS_DIR="${PI_AGENT_DIR}/skills"
 
 PIVM_PI_EXTENSION_SOURCES="${PIVM_PI_EXTENSION_SOURCES:-$SCRIPT_DIR/extensions}"
+PIVM_PI_SKILL_SOURCES="${PIVM_PI_SKILL_SOURCES:-}"
 PIVM_SYNC_GSTACK="${PIVM_SYNC_GSTACK:-1}"
 PIVM_GSTACK_PORT_DIR="${PIVM_GSTACK_PORT_DIR:-}"
 PIVM_GSTACK_REPO_URL="${PIVM_GSTACK_REPO_URL:-https://github.com/westn/gstack-pi-port.git}"
@@ -903,6 +904,56 @@ sync_pi_extensions() {
   done
 }
 
+sync_pi_skills() {
+  local sources="$PIVM_PI_SKILL_SOURCES"
+  [[ -n "$sources" ]] || return 0
+
+  ssh_cmd "mkdir -p ${PI_SKILLS_DIR}"
+
+  local IFS=":"
+  local src name
+  for src in $sources; do
+    [[ -n "$src" ]] || continue
+
+    if [[ -d "$src" ]]; then
+      if [[ -f "$src/SKILL.md" ]]; then
+        name="$(basename "$src")"
+        msg "Syncing pi skill '$name' from: $src"
+        rsync -az --delete \
+          --exclude '__pycache__/' \
+          --exclude '*.pyc' \
+          -e "$(rsync_ssh_cmd)" \
+          "$src/" "${SSH_USER}@127.0.0.1:${PI_SKILLS_DIR}/${name}/"
+      else
+        msg "Syncing pi skills from directory: $src"
+        rsync -az --delete \
+          --include '*/' \
+          --include 'SKILL.md' \
+          --include '*.py' \
+          --include '*.json' \
+          --include '*.md' \
+          --include '*.txt' \
+          --include '*.sh' \
+          --exclude '__pycache__/' \
+          --exclude '*.pyc' \
+          --exclude '*' \
+          -e "$(rsync_ssh_cmd)" \
+          "$src/" "${SSH_USER}@127.0.0.1:${PI_SKILLS_DIR}/"
+      fi
+    elif [[ -f "$src" ]]; then
+      name="$(basename "$src")"
+      name="${name%.*}"
+      msg "Syncing pi skill file '$name' from: $src"
+      ssh_cmd "mkdir -p ${PI_SKILLS_DIR}/${name}"
+      rsync -az \
+        -e "$(rsync_ssh_cmd)" \
+        "$src" "${SSH_USER}@127.0.0.1:${PI_SKILLS_DIR}/${name}/SKILL.md"
+    else
+      msg "Configured PIVM_PI_SKILL_SOURCES entry not found: $src" >&2
+    fi
+  done
+}
+
 resolve_gstack_port_source() {
   local override_dir="${PIVM_GSTACK_PORT_DIR:-}"
   if [[ -n "$override_dir" ]]; then
@@ -997,6 +1048,7 @@ provision_pi_customizations() {
   snapshot_host_clipboard
   sync_clipboard_snapshot
   sync_pi_extensions
+  sync_pi_skills
   sync_gstack_port
 }
 
@@ -1159,6 +1211,7 @@ Environment overrides:
 
 Pi customization:
   PIVM_PI_EXTENSION_SOURCES      Colon-separated extension files/dirs to sync (default: $SCRIPT_DIR/extensions)
+  PIVM_PI_SKILL_SOURCES          Colon-separated skill files/dirs to sync into ~/.pi/agent/skills (default: empty)
   PIVM_SYNC_GSTACK               1/0 sync gstack port into ~/.pi/agent/skills (default: 1)
   PIVM_GSTACK_PORT_DIR           Optional host path to prebuilt gstack port (contains SKILL.md)
   PIVM_GSTACK_REPO_URL           Repo URL to clone/pull when PORT_DIR unset/invalid (default: $PIVM_GSTACK_REPO_URL)
